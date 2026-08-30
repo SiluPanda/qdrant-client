@@ -1,7 +1,9 @@
 import json
 import math
 import uuid
+import warnings
 from collections import OrderedDict, defaultdict
+from copy import deepcopy
 from typing import (
     Any,
     Callable,
@@ -9,58 +11,67 @@ from typing import (
     Sequence,
     get_args,
 )
-from copy import deepcopy
-import warnings
 
 import numpy as np
 
 from qdrant_client import grpc as grpc
+from qdrant_client._pydantic_compat import construct
+from qdrant_client._pydantic_compat import to_jsonable_python as _to_jsonable_python
 from qdrant_client.common.client_warnings import show_warning_once
-from qdrant_client._pydantic_compat import construct, to_jsonable_python as _to_jsonable_python
 from qdrant_client.conversions import common_types as types
 from qdrant_client.conversions.common_types import get_args_subscribed
 from qdrant_client.conversions.conversion import GrpcToRest
 from qdrant_client.http import models
 from qdrant_client.http.models import ScoredPoint
-from qdrant_client.http.models.models import Distance, ExtendedPointId, SparseVector, OrderValue
+from qdrant_client.http.models.models import (
+    Distance,
+    ExtendedPointId,
+    OrderValue,
+    SparseVector,
+)
 from qdrant_client.hybrid.formula import evaluate_expression, raise_non_finite_error
-from qdrant_client.hybrid.fusion import reciprocal_rank_fusion, distribution_based_score_fusion
+from qdrant_client.hybrid.fusion import (
+    distribution_based_score_fusion,
+    reciprocal_rank_fusion,
+)
 from qdrant_client.local.distances import (
     ContextPair,
     ContextQuery,
     DenseQueryVector,
     DiscoveryQuery,
     DistanceOrder,
+    NaiveFeedbackCoefficients,
+    NaiveFeedbackQuery,
     RecoQuery,
     calculate_context_scores,
     calculate_discovery_scores,
     calculate_distance,
-    calculate_recommend_best_scores,
-    distance_to_order,
-    calculate_recommend_sum_scores,
     calculate_distance_core,
     calculate_naive_feedback_query,
-    NaiveFeedbackQuery,
-    FeedbackItem as DistFeedbackItem,
-    NaiveFeedbackCoefficients,
+    calculate_recommend_best_scores,
+    calculate_recommend_sum_scores,
+    distance_to_order,
 )
-from qdrant_client.local.multi_distances import (
-    MultiQueryVector,
-    MultiRecoQuery,
-    MultiDiscoveryQuery,
-    MultiContextQuery,
-    MultiContextPair,
-    calculate_multi_distance,
-    calculate_multi_recommend_best_scores,
-    calculate_multi_discovery_scores,
-    calculate_multi_context_scores,
-    calculate_multi_recommend_sum_scores,
-    calculate_multi_distance_core,
+from qdrant_client.local.distances import (
+    FeedbackItem as DistFeedbackItem,
 )
 from qdrant_client.local.json_path_parser import JsonPathItem, parse_json_path
+from qdrant_client.local.multi_distances import (
+    MultiContextPair,
+    MultiContextQuery,
+    MultiDiscoveryQuery,
+    MultiQueryVector,
+    MultiRecoQuery,
+    calculate_multi_context_scores,
+    calculate_multi_discovery_scores,
+    calculate_multi_distance,
+    calculate_multi_distance_core,
+    calculate_multi_recommend_best_scores,
+    calculate_multi_recommend_sum_scores,
+)
 from qdrant_client.local.order_by import to_order_value
 from qdrant_client.local.payload_filters import calculate_payload_mask, check_filter
-from qdrant_client.local.payload_value_extractor import value_by_key, parse_uuid
+from qdrant_client.local.payload_value_extractor import parse_uuid, value_by_key
 from qdrant_client.local.payload_value_setter import set_value_by_key
 from qdrant_client.local.persistence import CollectionPersistence
 from qdrant_client.local.sparse import (
@@ -78,9 +89,9 @@ from qdrant_client.local.sparse_distances import (
     calculate_sparse_context_scores,
     calculate_sparse_discovery_scores,
     calculate_sparse_recommend_best_scores,
+    calculate_sparse_recommend_sum_scores,
     merge_positive_and_negative_avg,
     sparse_avg,
-    calculate_sparse_recommend_sum_scores,
 )
 
 DEFAULT_VECTOR_NAME = ""
@@ -1247,7 +1258,7 @@ class LocalCollection:
         facet_filter: types.Filter | None = None,
         limit: int = 10,
     ) -> types.FacetResponse:
-        facet_hits: dict[types.FacetValue, int] = defaultdict(int)
+        facet_hits: dict[tuple[int, types.FacetValue], int] = defaultdict(int)
 
         mask = self._payload_and_non_deleted_mask(facet_filter)
 
@@ -1264,7 +1275,7 @@ class LocalCollection:
                 continue
 
             # Only count the same value for each point once
-            values_set: set[types.FacetValue] = set()
+            values_set: set[tuple[int, types.FacetValue]] = set()
 
             # Sanitize to use only valid values
             for v in values:
@@ -1276,14 +1287,14 @@ class LocalCollection:
                 if as_uuid:
                     v = str(as_uuid)
 
-                values_set.add(v)
+                values_set.add(self._facet_value_identity(v))
 
             for v in values_set:
                 facet_hits[v] += 1
 
         hits = [
             models.FacetValueHit(value=value, count=count)
-            for value, count in sorted(
+            for (_, value), count in sorted(
                 facet_hits.items(),
                 # order by count descending, then by value ascending
                 key=lambda x: (-x[1], x[0]),
@@ -1952,6 +1963,16 @@ class LocalCollection:
         elif isinstance(point_id, int):
             return "", point_id
         raise TypeError(f"Incompatible point id type: {type(point_id)}")
+
+    @staticmethod
+    def _facet_value_identity(value: types.FacetValue) -> tuple[int, types.FacetValue]:
+        if isinstance(value, bool):
+            return 0, value
+        if isinstance(value, int):
+            return 1, value
+        if isinstance(value, str):
+            return 2, value
+        raise TypeError(f"Incompatible facet value type: {type(value)}")
 
     def scroll(
         self,
